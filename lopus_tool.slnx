@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="lopus_tool.vcxproj" Id="13ff6068-22f3-4984-a811-abf5f8761ae0" />
+</Solution>
