@@ -405,20 +405,57 @@ static MemoryFile OpusBuild(s16* samples, u32 sampleCount, u32 sampleRate, u32 c
         return mfResult;
     }
 
-    if (sampleRate != 48000 && sampleRate != 24000 && sampleRate != 16000 &&
-        sampleRate != 12000 && sampleRate != 8000) {
-        panic("OpusBuild: Invalid sample rate (%uhz)\nAllowed sample rates are: 48000, 24000, 16000, 12000, and 8000", sampleRate);
-        return mfResult;
-    }
-
     if (channelCount != 1 && channelCount != 2) {
         panic("OpusBuild: Invalid channel count (%u)\nOnly one or two channels are allowed.", channelCount);
         return mfResult;
     }
 
+    s16* processedSamples = samples;
+    u32 processedSampleCount = sampleCount;
+    u32 processedSampleRate = sampleRate;
+    s16* resampledBuffer = NULL;
+
+    if (sampleRate != 48000 && sampleRate != 24000 && sampleRate != 16000 &&
+        sampleRate != 12000 && sampleRate != 8000) {
+
+        printf("Resampling from %u Hz to 48000 Hz\n", sampleRate);
+
+        processedSampleRate = 48000;
+        double ratio = (double)processedSampleRate / sampleRate;
+        u32 inputFrames = sampleCount / channelCount;
+        u32 targetFrameCount = (u32)(inputFrames * ratio);
+        processedSampleCount = targetFrameCount * channelCount;
+
+        resampledBuffer = (s16*)malloc(processedSampleCount * sizeof(s16));
+        if (!resampledBuffer) {
+            panic("OpusBuild: Failed to allocate resample buffer");
+            return mfResult;
+        }
+
+        for (u32 i = 0; i < targetFrameCount; i++) {
+            double srcPos = i / ratio;
+            u32 srcIdx = (u32)srcPos;
+            double frac = srcPos - srcIdx;
+
+            for (u32 ch = 0; ch < channelCount; ch++) {
+                if (srcIdx + 1 < inputFrames) {
+                    s16 sample0 = samples[srcIdx * channelCount + ch];
+                    s16 sample1 = samples[(srcIdx + 1) * channelCount + ch];
+                    resampledBuffer[i * channelCount + ch] = (s16)(sample0 * (1 - frac) + sample1 * frac);
+                }
+                else {
+                    resampledBuffer[i * channelCount + ch] = samples[srcIdx * channelCount + ch];
+                }
+            }
+        }
+
+        processedSamples = resampledBuffer;
+    }
+
     int opusError;
-    OpusEncoder* encoder = opus_encoder_create(sampleRate, (int)channelCount, OPUS_APPLICATION_AUDIO, &opusError);
+    OpusEncoder* encoder = opus_encoder_create(processedSampleRate, (int)channelCount, OPUS_APPLICATION_AUDIO, &opusError);
     if (opusError < 0 || !encoder) {
+        if (resampledBuffer) free(resampledBuffer);
         panic("OpusBuild: opus_encoder_create failed: %s", opus_strerror(opusError));
         return mfResult;
     }
@@ -426,6 +463,7 @@ static MemoryFile OpusBuild(s16* samples, u32 sampleCount, u32 sampleRate, u32 c
     opusError = opus_encoder_ctl(encoder, OPUS_SET_BITRATE(OPUS_DEFAULT_BITRATE));
     if (opusError < 0) {
         opus_encoder_destroy(encoder);
+        if (resampledBuffer) free(resampledBuffer);
         panic("OpusBuild: failed to set Opus bitrate to %u", OPUS_DEFAULT_BITRATE);
         return mfResult;
     }
@@ -433,6 +471,7 @@ static MemoryFile OpusBuild(s16* samples, u32 sampleCount, u32 sampleRate, u32 c
     opusError = opus_encoder_ctl(encoder, OPUS_SET_VBR(1));
     if (opusError < 0) {
         opus_encoder_destroy(encoder);
+        if (resampledBuffer) free(resampledBuffer);
         panic("OpusBuild: failed to enable Opus VBR");
         return mfResult;
     }
@@ -440,18 +479,20 @@ static MemoryFile OpusBuild(s16* samples, u32 sampleCount, u32 sampleRate, u32 c
     opusError = opus_encoder_ctl(encoder, OPUS_SET_VBR_CONSTRAINT(0));
     if (opusError < 0) {
         opus_encoder_destroy(encoder);
+        if (resampledBuffer) free(resampledBuffer);
         panic("OpusBuild: failed to disable Opus VBR constraint");
         return mfResult;
     }
 
     u32 frameDurationMs = 20;
-    u32 frameSize = (sampleRate / 1000) * frameDurationMs;
+    u32 frameSize = (processedSampleRate / 1000) * frameDurationMs;
     u32 samplesPerFrame = frameSize * channelCount;
 
     int preSkipSamples = 0;
     opusError = opus_encoder_ctl(encoder, OPUS_GET_LOOKAHEAD(&preSkipSamples));
     if (opusError < 0) {
         opus_encoder_destroy(encoder);
+        if (resampledBuffer) free(resampledBuffer);
         panic("OpusBuild: failed to get pre-skip sample count");
         return mfResult;
     }
@@ -459,6 +500,7 @@ static MemoryFile OpusBuild(s16* samples, u32 sampleCount, u32 sampleRate, u32 c
     OpusBuildPacket* rootPacket = (OpusBuildPacket*)malloc(sizeof(OpusBuildPacket));
     if (!rootPacket) {
         opus_encoder_destroy(encoder);
+        if (resampledBuffer) free(resampledBuffer);
         panic("OpusBuild: failed to allocate root packet");
         return mfResult;
     }
@@ -472,10 +514,11 @@ static MemoryFile OpusBuild(s16* samples, u32 sampleCount, u32 sampleRate, u32 c
     u8 buffer[OPUS_PACKETSIZE_MAX];
     u32 packetCount = 0;
 
-    for (u32 i = 0; i + samplesPerFrame <= sampleCount; i += samplesPerFrame) {
-        int nbBytes = opus_encode(encoder, samples + i, (int)frameSize, buffer, sizeof(buffer));
+    for (u32 i = 0; i + samplesPerFrame <= processedSampleCount; i += samplesPerFrame) {
+        int nbBytes = opus_encode(encoder, processedSamples + i, (int)frameSize, buffer, sizeof(buffer));
         if (nbBytes < 0) {
             opus_encoder_destroy(encoder);
+            if (resampledBuffer) free(resampledBuffer);
 
             OpusBuildPacket* temp = rootPacket->next;
             while (temp) {
@@ -492,6 +535,7 @@ static MemoryFile OpusBuild(s16* samples, u32 sampleCount, u32 sampleRate, u32 c
         OpusBuildPacket* packet = (OpusBuildPacket*)malloc(sizeof(OpusBuildPacket) + nbBytes - 1);
         if (!packet) {
             opus_encoder_destroy(encoder);
+            if (resampledBuffer) free(resampledBuffer);
 
             OpusBuildPacket* temp = rootPacket->next;
             while (temp) {
@@ -512,7 +556,7 @@ static MemoryFile OpusBuild(s16* samples, u32 sampleCount, u32 sampleRate, u32 c
         opusError = opus_encoder_ctl(encoder, OPUS_GET_FINAL_RANGE(&packet->finalRange));
         if (opusError < 0) {
             opus_encoder_destroy(encoder);
-
+            if (resampledBuffer) free(resampledBuffer);
             free(packet);
 
             OpusBuildPacket* temp = rootPacket->next;
@@ -544,6 +588,8 @@ static MemoryFile OpusBuild(s16* samples, u32 sampleCount, u32 sampleRate, u32 c
 
     mfResult.data_u8 = (u8*)malloc((size_t)mfResult.size);
     if (!mfResult.data_u8) {
+        if (resampledBuffer) free(resampledBuffer);
+
         OpusBuildPacket* temp = rootPacket->next;
         while (temp) {
             OpusBuildPacket* next = temp->next;
@@ -563,6 +609,8 @@ static MemoryFile OpusBuild(s16* samples, u32 sampleCount, u32 sampleRate, u32 c
         free(mfResult.data_u8);
         mfResult.data_u8 = NULL;
 
+        if (resampledBuffer) free(resampledBuffer);
+
         OpusBuildPacket* temp = rootPacket->next;
         while (temp) {
             OpusBuildPacket* next = temp->next;
@@ -580,7 +628,7 @@ static MemoryFile OpusBuild(s16* samples, u32 sampleCount, u32 sampleRate, u32 c
     fileHeader->version = OPUS_VERSION;
     fileHeader->channelCount = (u8)channelCount;
     fileHeader->frameSize = 0;
-    fileHeader->sampleRate = sampleRate;
+    fileHeader->sampleRate = processedSampleRate;
     fileHeader->dataOffset = sizeof(OpusFileHeader);
     fileHeader->_unk14 = 0;
     fileHeader->contextOffset = 0;
@@ -591,6 +639,8 @@ static MemoryFile OpusBuild(s16* samples, u32 sampleCount, u32 sampleRate, u32 c
     if (!dataChunk) {
         free(mfResult.data_u8);
         mfResult.data_u8 = NULL;
+
+        if (resampledBuffer) free(resampledBuffer);
 
         OpusBuildPacket* temp = rootPacket->next;
         while (temp) {
@@ -614,6 +664,8 @@ static MemoryFile OpusBuild(s16* samples, u32 sampleCount, u32 sampleRate, u32 c
         if (!currentPacketHeader) {
             free(mfResult.data_u8);
             mfResult.data_u8 = NULL;
+
+            if (resampledBuffer) free(resampledBuffer);
 
             OpusBuildPacket* temp = rootPacket->next;
             while (temp) {
@@ -642,6 +694,10 @@ static MemoryFile OpusBuild(s16* samples, u32 sampleCount, u32 sampleRate, u32 c
         currentPacket = nextPacket;
     }
     free(rootPacket);
+
+    if (resampledBuffer) {
+        free(resampledBuffer);
+    }
 
     return mfResult;
 }
